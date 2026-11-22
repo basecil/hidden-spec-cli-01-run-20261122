@@ -1,8 +1,7 @@
 // main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 4, 9 and 10 of SPEC.md: the command line, the output and
 // exit codes, safe paths, format detection, JSON edits and the all-or-nothing write. Unified diffs (section 6),
-// three-tier matching (section 5) and SEARCH/REPLACE blocks (section 7) are implemented below, with R-lines for
-// moves (section 2). V4A patches (section 8) are still detected and then read as holding no edit, so they answer
-// `error: parse 1`: reading them is the next session's work. Node 22, the standard library alone; run it as
+// three-tier matching (section 5), SEARCH/REPLACE blocks (section 7) and V4A patches (section 8) are implemented
+// below, with R-lines for moves (section 2). Node 22, the standard library alone; run it as
 // `node main.ts [options] [PATCH]`.
 //
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
@@ -577,6 +576,233 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
   return edits;
 }
 
+/** Build the lines a V4A chunk writes: context lines as the file's own matched lines, other lines re-indented at tier 2 (SPEC.md section 5). */
+function buildChunkReplacement(entries: ChunkEntry[], file: string[], at: number, tier: number): string[] {
+  const out: string[] = [];
+  let oIdx = 0;
+  let f = '';
+  let p = '';
+  if (tier === 2) {
+    f = leadingWs(file[at]!);
+    const firstOld = entries.find((e) => e.kind === 'ctx' || e.kind === 'old');
+    p = firstOld === undefined ? '' : leadingWs(firstOld.text);
+  }
+  for (const e of entries) {
+    if (e.kind === 'ctx') {
+      out.push(file[at + oIdx]!);
+      oIdx++;
+    } else if (e.kind === 'old') {
+      oIdx++;
+    } else {
+      out.push(tier === 2 ? reindentLine(e.text, f, p) : e.text);
+    }
+  }
+  return out;
+}
+
+type ChunkEntry = { kind: 'ctx' | 'old' | 'new'; text: string };
+
+interface V4aChunk {
+  anchor: string | null;
+  entries: ChunkEntry[];
+  eof: boolean;
+}
+
+/** The first line at or after `from` equal to the anchor, at the first tier where one is (SPEC.md section 8, both sides a single line). */
+function findAnchor(anchor: string, file: string[], from: number, strict: boolean): number | null {
+  const tiers = strict ? [0] : [0, 1, 2];
+  for (const tier of tiers) {
+    const want = tierNorm(anchor, tier);
+    for (let i = from; i < file.length; i++) {
+      if (tierNorm(file[i]!, tier) === want) return i;
+    }
+  }
+  return null;
+}
+
+/** The first occurrence of O at or after the cursor, at the first tier with one; an end-of-file chunk takes only an occurrence that ends at the file's last line. */
+function findChunkOccurrence(old: string[], file: string[], from: number, eof: boolean, strict: boolean): { at: number; tier: number } | null {
+  const tiers = strict ? [0] : [0, 1, 2];
+  for (const tier of tiers) {
+    const want = old.map((l) => tierNorm(l, tier));
+    const have = file.map((l) => tierNorm(l, tier));
+    for (let i = from; i + old.length <= file.length; i++) {
+      if (eof && i + old.length !== file.length) continue;
+      let ok = true;
+      for (let j = 0; j < old.length; j++) {
+        if (have[i + j] !== want[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return { at: i, tier };
+    }
+  }
+  return null;
+}
+
+/** Apply a V4A section's chunks in order to a file's text, with the cursor (SPEC.md section 8). Throws Fail('no-match', path) when an anchor or a chunk's old lines are not found. */
+function applyV4aChunks(before: string, chunks: V4aChunk[], strict: boolean, path: string): string {
+  const split = splitFile(before);
+  const lines = split.lines;
+  const br = split.br;
+  const final = split.final;
+  let cursor = 0;
+  for (const chunk of chunks) {
+    if (chunk.anchor !== null) {
+      const anchorAt = findAnchor(chunk.anchor, lines, cursor, strict);
+      if (anchorAt === null) throw new Fail('no-match', path);
+      cursor = anchorAt + 1;
+    }
+    const oEntries = chunk.entries.filter((e) => e.kind === 'ctx' || e.kind === 'old');
+    const old = oEntries.map((e) => e.text);
+    if (old.length === 0) {
+      const add = chunk.entries.filter((e) => e.kind === 'new').map((e) => e.text);
+      const at = chunk.eof ? lines.length : cursor;
+      lines.splice(at, 0, ...add);
+      cursor = at + add.length;
+      continue;
+    }
+    const found = findChunkOccurrence(old, lines, cursor, chunk.eof, strict);
+    if (found === null) throw new Fail('no-match', path);
+    const replacement = buildChunkReplacement(chunk.entries, lines, found.at, found.tier);
+    lines.splice(found.at, old.length, ...replacement);
+    cursor = found.at + replacement.length;
+  }
+  return joinFile(lines, br, final);
+}
+
+/** A V4A section header line: `*** Add File: `, `*** Delete File: ` or `*** Update File: `, the path the rest of the line with its surrounding spaces removed. */
+function v4aHeader(l: string): { kind: 'add' | 'delete' | 'update'; path: string } | null {
+  if (l.startsWith('*** Add File: ')) return { kind: 'add', path: l.slice('*** Add File: '.length).trim() };
+  if (l.startsWith('*** Delete File: ')) return { kind: 'delete', path: l.slice('*** Delete File: '.length).trim() };
+  if (l.startsWith('*** Update File: ')) return { kind: 'update', path: l.slice('*** Update File: '.length).trim() };
+  return null;
+}
+
+/** One V4A section as an edit (SPEC.md section 8). `body` is the section's lines with blank lines at its end removed; `headerLine` is the 1-based line of the section header. Throws Exit2 on a parse error. */
+function v4aSectionEdit(hdr: { kind: 'add' | 'delete' | 'update'; path: string }, body: string[], headerLine: number, strict: boolean): Edit {
+  const path = hdr.path;
+  if (hdr.kind === 'add') {
+    const fileLines: string[] = [];
+    for (let k = 0; k < body.length; k++) {
+      const l = body[k]!;
+      if (l.startsWith('+')) fileLines.push(l.slice(1));
+      else if (l === '') fileLines.push('');
+      else throw new Exit2(`error: parse ${headerLine + 1 + k}`);
+    }
+    return (tree) => {
+      if (!safe(path)) throw new Fail('unsafe', path);
+      if (tree.get(path) !== null) throw new Fail('exists', path);
+      tree.now.set(path, joinFile(fileLines, '\n', true));
+    };
+  }
+  if (hdr.kind === 'delete') {
+    for (let k = 0; k < body.length; k++) {
+      if (!blank(body[k]!)) throw new Exit2(`error: parse ${headerLine + 1 + k}`);
+    }
+    return (tree) => {
+      if (!safe(path)) throw new Fail('unsafe', path);
+      if (tree.get(path) === null) throw new Fail('missing', path);
+      tree.now.set(path, null);
+    };
+  }
+  let moveTo: string | null = null;
+  let k = 0;
+  if (body.length > 0 && body[0]!.startsWith('*** Move to: ')) {
+    moveTo = body[0]!.slice('*** Move to: '.length).trim();
+    k = 1;
+  }
+  const chunks: V4aChunk[] = [];
+  let cur: V4aChunk | null = null;
+  const closeChunk = (): void => {
+    if (cur !== null) {
+      chunks.push(cur);
+      cur = null;
+    }
+  };
+  for (; k < body.length; k++) {
+    const l = body[k]!;
+    const lineNo = headerLine + 1 + k;
+    if (l.startsWith('@@')) {
+      closeChunk();
+      const anchor = l.slice(2).trim();
+      cur = { anchor: anchor === '' ? null : anchor, entries: [], eof: false };
+      continue;
+    }
+    if (l === '*** End of File') {
+      if (cur === null) throw new Exit2(`error: parse ${lineNo}`);
+      cur.eof = true;
+      closeChunk();
+      continue;
+    }
+    const c = l[0];
+    if (c === ' ' || c === '-' || c === '+' || l === '') {
+      if (cur === null) {
+        if (chunks.length > 0) throw new Exit2(`error: parse ${lineNo}`);
+        cur = { anchor: null, entries: [], eof: false };
+      }
+      if (c === ' ') cur.entries.push({ kind: 'ctx', text: l.slice(1) });
+      else if (c === '-') cur.entries.push({ kind: 'old', text: l.slice(1) });
+      else if (c === '+') cur.entries.push({ kind: 'new', text: l.slice(1) });
+      else cur.entries.push({ kind: 'ctx', text: '' });
+      continue;
+    }
+    throw new Exit2(`error: parse ${lineNo}`);
+  }
+  closeChunk();
+  if (chunks.length === 0 && moveTo === null) throw new Exit2(`error: parse ${headerLine}`);
+  return (tree) => {
+    if (!safe(path)) throw new Fail('unsafe', path);
+    if (moveTo !== null && !safe(moveTo)) throw new Fail('unsafe', moveTo);
+    const before = tree.get(path);
+    if (before === null) throw new Fail('missing', path);
+    if (moveTo !== null && tree.get(moveTo) !== null) throw new Fail('exists', moveTo);
+    const after = applyV4aChunks(before, chunks, strict, path);
+    if (moveTo !== null) {
+      tree.now.set(path, null);
+      tree.now.set(moveTo, after);
+      tree.moves.push([path, moveTo]);
+    } else {
+      tree.now.set(path, after);
+    }
+  };
+}
+
+/** Read a V4A patch (SPEC.md section 8) into one edit per section. Throws Exit2 on a parse error. */
+function v4aEdits(lines: string[], strict: boolean): Edit[] {
+  const first = lines.findIndex((l) => !blank(l));
+  if (first < 0) throw new Exit2('error: parse 1');
+  if (lines[first]!.trim() !== '*** Begin Patch') throw new Exit2(`error: parse ${first + 1}`);
+  let last = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!blank(lines[i]!)) {
+      last = i;
+      break;
+    }
+  }
+  if (lines[last]!.trim() !== '*** End Patch') throw new Exit2(`error: parse ${lines.length + 1}`);
+  const edits: Edit[] = [];
+  let i = first + 1;
+  while (i < last) {
+    const l = lines[i]!;
+    if (blank(l)) {
+      i++;
+      continue;
+    }
+    const hdr = v4aHeader(l);
+    if (hdr === null) throw new Exit2(`error: parse ${i + 1}`);
+    let j = i + 1;
+    while (j < last && v4aHeader(lines[j]!) === null) j++;
+    const raw = lines.slice(i + 1, j);
+    let end = raw.length;
+    while (end > 0 && blank(raw[end - 1]!)) end--;
+    edits.push(v4aSectionEdit(hdr, raw.slice(0, end), i + 1, strict));
+    i = j;
+  }
+  return edits;
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -605,7 +831,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'search-replace' ? searchReplaceEdits(lines, strict) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'search-replace' ? searchReplaceEdits(lines, strict) : v4aEdits(lines, strict);
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
