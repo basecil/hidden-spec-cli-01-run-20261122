@@ -1,7 +1,7 @@
 // main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 4, 9 and 10 of SPEC.md: the command line, the output and
-// exit codes, safe paths, format detection, JSON edits and the all-or-nothing write. Unified diffs (section 6) and
-// three-tier matching (section 5) are implemented below, with R-lines for moves (section 2). SEARCH/REPLACE blocks
-// (section 7) and V4A patches (section 8) are still detected and then read as holding no edit, so they answer
+// exit codes, safe paths, format detection, JSON edits and the all-or-nothing write. Unified diffs (section 6),
+// three-tier matching (section 5) and SEARCH/REPLACE blocks (section 7) are implemented below, with R-lines for
+// moves (section 2). V4A patches (section 8) are still detected and then read as holding no edit, so they answer
 // `error: parse 1`: reading them is the next session's work. Node 22, the standard library alone; run it as
 // `node main.ts [options] [PATCH]`.
 //
@@ -496,6 +496,87 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   });
 }
 
+/** Re-indent one N line at tier 2 (SPEC.md section 5): F is the leading spaces and tabs of the file's first matched line, P those of O's first line. */
+function reindentLine(t: string, f: string, p: string): string {
+  return t !== '' && t.trim() !== '' && t.startsWith(p) ? f + t.slice(p.length) : t;
+}
+
+/** One SEARCH/REPLACE block as an edit (SPEC.md section 7). */
+function srEdit(path: string, oldLines: string[], newLines: string[], strict: boolean): Edit {
+  return (tree) => {
+    if (!safe(path)) throw new Fail('unsafe', path);
+    if (oldLines.length === 0) {
+      if (tree.get(path) !== null) throw new Fail('exists', path);
+      tree.now.set(path, joinFile(newLines, '\n', true));
+      return;
+    }
+    const before = tree.get(path);
+    if (before === null) throw new Fail('missing', path);
+    const split = splitFile(before);
+    const found = findOccurrences(oldLines, split.lines, strict);
+    if (found === null) throw new Fail('no-match', path);
+    if (found.positions.length > 1) throw new Fail('ambiguous', path);
+    const at = found.positions[0]!;
+    let replacement = newLines;
+    if (found.tier === 2) {
+      const f = leadingWs(split.lines[at]!);
+      const p = leadingWs(oldLines[0]!);
+      replacement = newLines.map((t) => reindentLine(t, f, p));
+    }
+    const out = [...split.lines];
+    out.splice(at, oldLines.length, ...replacement);
+    tree.now.set(path, joinFile(out, split.br, split.final));
+  };
+}
+
+/** Read a SEARCH/REPLACE patch (SPEC.md section 7) into one edit per block. Throws Exit2 on a parse error. */
+function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
+  const edits: Edit[] = [];
+  let prevReplace = -1;
+  let prevPath: string | null = null;
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i]!.trimEnd() !== '<<<<<<< SEARCH') {
+      i++;
+      continue;
+    }
+    let path: string | null = null;
+    for (let j = i - 1; j > prevReplace; j--) {
+      const cand = lines[j]!;
+      if (blank(cand)) continue;
+      if (cand.trim().startsWith('```')) continue;
+      path = cand.trim();
+      break;
+    }
+    if (path === null) {
+      if (prevPath === null) throw new Exit2(`error: parse ${i + 1}`);
+      path = prevPath;
+    }
+    let sep = -1;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (lines[j]!.trimEnd() === '=======') {
+        sep = j;
+        break;
+      }
+    }
+    let end = -1;
+    if (sep >= 0) {
+      for (let j = sep + 1; j < lines.length; j++) {
+        if (lines[j]!.trimEnd() === '>>>>>>> REPLACE') {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (sep < 0 || end < 0) throw new Exit2(`error: parse ${i + 1}`);
+    edits.push(srEdit(path, lines.slice(i + 1, sep), lines.slice(sep + 1, end), strict));
+    prevPath = path;
+    prevReplace = end;
+    i = end + 1;
+  }
+  return edits;
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -524,7 +605,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'search-replace' ? searchReplaceEdits(lines, strict) : [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
